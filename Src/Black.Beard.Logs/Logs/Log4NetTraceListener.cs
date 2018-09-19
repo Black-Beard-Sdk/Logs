@@ -2,13 +2,13 @@
 using log4net.Core;
 using log4net.Repository;
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
-using System.Linq.Expressions;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Text;
 
 namespace Bb.Logs
 {
@@ -19,15 +19,29 @@ namespace Bb.Logs
     public class Log4NetTraceListener : System.Diagnostics.TraceListener
     {
 
+        static Log4NetTraceListener()
+        {
+            Log4NetTraceListener.
+            _sessionId = Guid.NewGuid().ToString();
+        }
+        
         /// <summary>
         /// Initialize log with log4net
         /// </summary>
         /// <param name="name"></param>
         /// <param name="log4NetconfigPath"></param>
-        public static void Initialize(string name, string log4NetconfigPath = "Log4Net.config")
+        public static Log4NetTraceListener Initialize(string name, string log4NetconfigPath = "Log4Net.config")
         {
+            AssemblyLogger.Initialize();
             Log4NetTraceListener log = new Log4NetTraceListener(name, log4NetconfigPath);
             System.Diagnostics.Trace.Listeners.Add(log);
+            return log;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            base.Dispose(disposing);
+            System.Diagnostics.Trace.Listeners.Remove(this);
         }
 
         private Log4NetTraceListener(string name, string log4NetconfigPath)
@@ -38,7 +52,12 @@ namespace Bb.Logs
 
             _logger = LoggerManager.GetLogger(assembly, name);
             _repository = _logger.Repository;
-            XmlConfigurator.Configure(_repository, new FileInfo(log4NetconfigPath));
+
+            var file = new FileInfo(log4NetconfigPath);
+            if (file.Exists)
+            {
+                XmlConfigurator.Configure(_repository, file);
+            }
 
             LogInternal(Level.Info, "Log initialized", new List<KeyValuePair<string, object>>());
 
@@ -53,16 +72,6 @@ namespace Bb.Logs
         public static void AddLevel(int value, string name, string displayName)
         {
             LogLevel.AddLevel(value, name, displayName);
-        }
-
-        public override void Fail(string message)
-        {
-            base.Fail(message);
-        }
-
-        public override void Fail(string message, string detailMessage)
-        {
-            base.Fail(message, detailMessage);
         }
 
         public override void Write(string message)
@@ -83,9 +92,8 @@ namespace Bb.Logs
         public override void Write(object o, string category)
         {
             if (o is Exception e)
-            {
                 LogInternal(category.ConvertLevel(), e.Message, e, new List<KeyValuePair<string, object>>());
-            }
+
             else
             {
                 var p = GetParameters(o, out string msg);
@@ -101,9 +109,8 @@ namespace Bb.Logs
         public override void WriteLine(object o, string category)
         {
             if (o is Exception e)
-            {
                 LogInternal(category.ConvertLevel(), e.Message, e, new List<KeyValuePair<string, object>>());
-            }
+
             else
             {
                 var p = GetParameters(o, out string msg);
@@ -119,9 +126,8 @@ namespace Bb.Logs
         public override void WriteLine(object o)
         {
             if (o is Exception e)
-            {
                 LogInternal(Level.Info, e.Message, e, new List<KeyValuePair<string, object>>());
-            }
+
             else
             {
                 var p = GetParameters(o, out string msg);
@@ -159,7 +165,16 @@ namespace Bb.Logs
                         break;
 
                     default:
-                        _parameters.Add(new KeyValuePair<string, object>(item.Key, item.Value));
+                        if (item.Value is Exception e)
+                        {
+                            var e1 = SerializeException(e, _parameters);
+                            StringBuilder sb = new StringBuilder(5 * 1024);
+                            e1.Serialize(sb);
+                            _parameters.Add(new KeyValuePair<string, object>(item.Key, GetBase64Text(sb)));
+                        }
+                        else
+                            _parameters.Add(new KeyValuePair<string, object>(item.Key, item.Value));
+
                         break;
 
                 }
@@ -183,9 +198,13 @@ namespace Bb.Logs
                 try
                 {
                     _logger.Log(logEntry);
+                    if (Events != null)
+                        PushEvent(logEntry, false);
                 }
                 catch (Exception ex1)
                 {
+                    if (Events != null)
+                        PushEvent(logEntry, true);
                     Console.WriteLine("Log fail. " + ex1.Message);
                 }
 
@@ -199,31 +218,79 @@ namespace Bb.Logs
 
             if (logLevel != Level.Off)
             {
-
                 log4net.Core.LoggingEvent logEntry = CreateLogEntry(logLevel, message, null, dicParameters);
-
-                try
-                {
-                    _logger.Log(logEntry);
-                }
-                catch (Exception ex1)
-                {
-                    Console.WriteLine("Log fail. " + ex1.Message);
-                }
-
+                Push(logEntry);
             }
 
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void Push(LoggingEvent logEntry)
+        {
+            try
+            {
+                _logger.Log(logEntry);
+                if (Events != null)
+                    PushEvent(logEntry, false);
+            }
+            catch (Exception ex1)
+            {
+                if (Events != null)
+                    PushEvent(logEntry, false);
+                Console.WriteLine("Log fail. " + ex1.Message);
 
+            }
+        }
+
+        private void PushEvent(LoggingEvent logEntry, bool failed)
+        {
+
+            Events(this, new LogEventArg()
+            {
+
+                FailedToPushLog = failed,
+
+                Message = logEntry.RenderedMessage,
+                Level = logEntry.Level.Name,
+                UserName = logEntry.UserName,
+                Domain = logEntry.Domain,
+                TimeStampUtc = logEntry.TimeStampUtc,
+                ThreadName = logEntry.ThreadName,
+                LoggerName = logEntry.LoggerName,
+                //LocationInformation = logEntry.LocationInformation,
+                Identity = logEntry.Identity,
+                Properties = GetProperties(logEntry.Properties),
+
+            });
+
+        }
+
+        private IEnumerable<KeyValuePair<string, object>> GetProperties(log4net.Util.PropertiesDictionary properties)
+        {
+
+            List<KeyValuePair<string, object>> result = new List<KeyValuePair<string, object>>();
+
+            foreach (System.Collections.DictionaryEntry item in properties)
+                result.Add(new KeyValuePair<string, object>(item.Key.ToString(), item.Value));
+
+            return result;
+
+        }
+
+        public static event EventHandler<LogEventArg> Events;
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private log4net.Core.LoggingEvent CreateLogEntry(log4net.Core.Level level, string message, Exception ex, List<KeyValuePair<string, object>> customInfos)
         {
 
+            customInfos.Add(new KeyValuePair<string, object>("session", _sessionId));
+
             if (ex != null)
             {
-                SerializeException(ex, customInfos);
+                var e1 = SerializeException(ex, customInfos);
+                StringBuilder sb = new StringBuilder(5 * 1024);
+                e1.Serialize(sb);
+                customInfos.Add(new KeyValuePair<string, object>("Exception", GetBase64Text(sb)));
             }
 
             string m = !string.IsNullOrEmpty(message)
@@ -232,69 +299,52 @@ namespace Bb.Logs
                     ? ex.Message
                     : string.Empty;
 
-            log4net.Core.LoggingEvent result;
-            if (ex == null)
-            {
-                result = Generate(level, m);
-            }
-            else
-            {
-                result = Generate(level, ex, m);
-            }
+            LoggingEvent result = Generate(level, m);
 
             foreach (var item in customInfos)
-            {
                 if (!string.IsNullOrEmpty(item.Key))
-                {
                     result.Properties[item.Key] = item.Value;
-                }
-            }
 
             return result;
 
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private LoggingEvent Generate(log4net.Core.Level level, Exception ex, string m)
+        private static string GetBase64Text(StringBuilder sb)
         {
-            log4net.Core.LoggingEvent result;
-            var reflectedType = ex.TargetSite != null ? ex.TargetSite.ReflectedType : typeof(object);
-            result = new log4net.Core.LoggingEvent(reflectedType, _repository, Name, level, m, ex);
-            return result;
+            return Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(sb.ToString()));
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private LoggingEvent Generate(log4net.Core.Level level, string m)
         {
+
             StackFrame stackFrame = null;
             System.Reflection.MethodBase method = null;
-
             var stackFrames = new StackTrace().GetFrames();
-
             for (int indexFrame = 0; indexFrame < stackFrames.Length; ++indexFrame)
             {
                 stackFrame = stackFrames[indexFrame];
                 method = stackFrame.GetMethod();
-                if (method.DeclaringType != typeof(Log4NetTraceListener))
-                {
+                if (method.DeclaringType != typeof(Log4NetTraceListener) && method.Name != "TraceInternals")
                     break;
-                }
             }
 
             var result = new log4net.Core.LoggingEvent(method.ReflectedType, _repository, new LoggingEventData()
             {
                 Level = level,
                 Message = m,
-                LoggerName = Name,
+                LoggerName = base.Name,
                 LocationInfo = new LocationInfo(GetMethodName(method),
                                                 method.ToString(),
                                                 stackFrame.GetFileName(),
                                                 stackFrame.GetFileLineNumber().ToString())
             }, FixFlags.All);
+
             return result;
         }
 
-
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static string GetMethodName(System.Reflection.MethodBase method)
         {
             var type = method.ReflectedType;
@@ -309,369 +359,99 @@ namespace Bb.Logs
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static void SerializeException(Exception ex, List<KeyValuePair<string, object>> dicParameters)
+        private ExceptionDescriptor SerializeException(Exception ex, List<KeyValuePair<string, object>> dicParameters)
         {
 
-            if (!string.IsNullOrEmpty(ex.Source))
+            ExceptionDescriptor exceptionDescriptor = new ExceptionDescriptor()
             {
-                dicParameters.Add(new KeyValuePair<string, object>("Source", ex.Source));
+                Message = ex.Message,
+            };
+
+            var stack = new StackTrace(ex);
+            StringBuilder sb1 = new StringBuilder();
+
+            Stack<StringBuilder> _st = new Stack<StringBuilder>();
+            foreach (StackFrame frame in stack.GetFrames())
+            {
+                var method = frame.GetMethod();
+                AssemblyLogger.Instance.GetAssemblies(method.DeclaringType.Assembly, _st);
+                exceptionDescriptor.Stack.Add(new CodeDescriptor(frame.GetILOffset(), method));
             }
 
-            if (ex.TargetSite != null)
-            {
-                dicParameters.Add(new KeyValuePair<string, object>("Method", ex.TargetSite.Name));
-            }
+            PushAssembliesinLog(_st);
 
             if (ex.InnerException != null)
+                exceptionDescriptor.Inner = SerializeException(ex.InnerException, dicParameters);
+            
+            return exceptionDescriptor;
+
+        }
+
+        private void PushAssembliesinLog(Stack<StringBuilder> _st)
+        {
+            while (_st.Count > 0)
             {
-                dicParameters.Add(new KeyValuePair<string, object>("InnerException", ex.InnerException.ToString()));
+
+                var sb = _st.Pop();
+
+                string name = ExtractName(sb);
+
+                var result = new LoggingEvent
+                (
+                    GetType(), _repository,
+                    new LoggingEventData()
+                    {
+                        Level = Level.Fatal,
+                        Message = "assembly_content",
+                        LoggerName = base.Name,
+                    },
+                    FixFlags.All
+                );
+
+                result.Properties["session"] = _sessionId;
+                result.Properties[name] = sb.ToString();
+
+                this.Push(result);
+
             }
+        }
+
+        private static string ExtractName(StringBuilder sb)
+        {
+            StringBuilder sb2 = new StringBuilder(100);
+            for (int index = 0; index < sb.Length; index++)
+            {
+                var c = sb[index];
+                if (c == ';')
+                {
+                    sb.Remove(0, index + 1);
+                    break;
+                }
+                else
+                    sb2.Append(c);
+            }
+
+            return sb2.ToString();
+
         }
 
         private readonly ILogger _logger;
         private readonly ILoggerRepository _repository;
-
-    }
-
-    internal static class LogLevel
-    {
-
-        static LogLevel()
-        {
-            _level = new Dictionary<string, Level>();
-
-        }
-
-        internal static void AddLevel(int value, string name, string displayName)
-        {
-            _level.Add(name, new Level(value, name, displayName));
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        internal static Level ConvertLevel(this string category)
-        {
-
-            string cat = category.ToLower();
-
-            switch (cat)
-            {
-
-                case "off":
-                    return Level.Off;           // 2 147 483 647
-
-                case "log4net_debug":
-                    return Level.Log4Net_Debug; // 120 000
-
-                case "emergency":
-                    return Level.Emergency;     // 120 000
-
-                case "fatal":
-                    return Level.Fatal;         // 110 000
-
-                case "alert":
-                    return Level.Alert;         // 100 000
-
-                case "critical":
-                    return Level.Critical;      // 90 000
-
-                case "severe":
-                    return Level.Severe;        // 80 000
-
-                case "error":
-                    return Level.Error;         // 70 000
-
-                case "warn":
-                    return Level.Warn;          // 60 000
-
-                case "notice":
-                    return Level.Notice;        // 50 000
-
-                case "info":
-                    return Level.Info;          // 40 000
-
-                case "debug":
-                    return Level.Debug;         // 30 000
-
-                case "fine":
-                    return Level.Fine;          // 30 000
-
-                case "finer":
-                    return Level.Finer;         // 20 000
-
-                case "trace":
-                    return Level.Trace;         // 20 000
-
-                case "finest":
-                    return Level.Finest;        // 10 000
-
-                case "verbose":
-                    return Level.Verbose;       // 10 000
-
-                case "all":
-                    return Level.All;           // -2 147 483 648
-
-                default:
-                    if (!_level.TryGetValue(cat, out Level level))
-                        lock(_lock)
-                            if (!_level.TryGetValue(cat, out level))
-                                _level.Add(cat, (level = new Level(Level.Verbose.Value - 1, cat)));
-
-                    return level;
-                    
-            }
-
-        }
-
-        private static Dictionary<string, Level> _level;
-        private static readonly object _lock = new object();
-
-    }
-
-    internal static class LoggerExtension
-    {
-
-        /// <summary>
-        /// format the serialization of the specified object
-        /// </summary>
-        /// <typeparam name="T"></typeparam>
-        /// <param name="source">object sour to serialized</param>
-        /// <param name="format">output format</param>
-        /// <returns>string of the format with the source propertie's serialized</returns>
-        public static Dictionary<string, object> GetDictionnaryProperties(this object source, bool ignoreCase = true)
-        {
-            System.Diagnostics.Contracts.Contract.Requires(!object.Equals(source, null), "null reference exception 'source'");
-            return GetPropertiesMethod(source.GetType(), ignoreCase)(source);
-        }
-
-        #region Compile object serialization
-
-        /// <summary>
-        /// Get compiled method or create
-        /// </summary>
-        /// <typeparam name="T"></typeparam>
-        /// <param name="type"></param>
-        /// <param name="format"></param>
-        /// <returns></returns>
-        private static Func<object, Dictionary<string, object>> GetPropertiesMethod(Type type, bool ignoreCase)
-        {
-
-            if (type == null)
-            {
-                throw new ArgumentNullException(nameof(type));
-            }
-
-            if (!_funcs.TryGetValue(type, out Func<object, Dictionary<string, object>> result))
-            {
-                lock (_lock)
-                {
-                    if (!_funcs.TryGetValue(type, out result))
-                    {
-                        _funcs.Add(type, result = CompileObject(type, ignoreCase));
-                    }
-                }
-            }
-
-            return result;
-
-        }
-
-        /// <summary>
-        /// Compile method for serialize all properties of the specified type
-        /// </summary>
-        /// <typeparam name="T"></typeparam>
-        /// <param name="typeSource"></param>
-        /// <param name="format"></param>
-        /// <returns></returns>
-        private static Func<object, Dictionary<string, object>> CompileObject(Type typeSource, bool ignoreCase)
-        {
-
-            Type containerType = typeof(Dictionary<string, object>);
-            Type stringType = typeof(string);
-            var _properties = typeSource.GetAllProperties().Where(c => c.CanRead);
-            var properties = new HashSet<string>();
-            var m = containerType.GetNamedMethod("Add", typeof(string), typeof(object));
-
-            // variables
-            var parameterIn = Expression.Parameter(typeof(object), "argIn");
-            var parameter = Expression.Variable(typeSource, "arg1");
-            var dic = Expression.Variable(containerType, "dic");
-
-            var lst = new List<Expression>()
-            {
-                // var dic = new Dictionary<string, object>();
-                dic.CreateObject(),
-                parameter.SettedBy(parameterIn.As(typeSource)),
-
-            };
-
-            foreach (PropertyInfo item in _properties)
-            {
-
-                var n = item.Name;
-
-                if (ignoreCase)
-                {
-                    n = n.ToLower();
-                }
-
-                if (properties.Add(item.Name))
-                {
-                    var p = item.PropertyType;
-                    var m1 = parameter.Member(item);
-
-                    if (p == typeof(object))
-                    {
-                        lst.Add(dic.Invoke(m, Expression.Constant(n), m1));
-                    }
-                    else
-                    {
-                        lst.Add(dic.Invoke(m, Expression.Constant(n), m1.As(typeof(object))));
-                    }
-                }
-            }
-            // return builder.ToString();
-            lst.Add(dic);
-
-            // Create func
-            BlockExpression block = Expression.Block(containerType, new ParameterExpression[] { dic, parameter }, lst);
-            var lbd = Expression.Lambda<Func<object, Dictionary<string, object>>>(block, parameterIn);
-
-            return lbd.Compile();
-
-        }
-
-        private static readonly object _lock = new object();
-
-        #endregion Compile object serialization
-
-        #region Expressions
-
-        public static BinaryExpression CreateObject(this Expression self)
-        {
-            return self.SettedBy(Expression.New(self.Type));
-        }
-
-        public static BinaryExpression SettedBy(this Expression self, Expression right)
-        {
-            return Expression.Assign(self, right);
-        }
-
-        public static UnaryExpression As(this Expression self, Type type)
-        {
-            return Expression.ConvertChecked(self, type);
-        }
-
-        public static MemberExpression Member(this Expression self, PropertyInfo property)
-        {
-            return Expression.Property(self, property);
-        }
-
-        public static MethodCallExpression Invoke(this Expression self, MethodInfo method, params Expression[] args)
-        {
-
-            if (args.Length == 0)
-            {
-                return Expression.Call(self, method);
-            }
-            else
-            {
-                return Expression.Call(self, method, args);
-            }
-        }
-
-        public static MethodInfo GetNamedMethod(this Type componentType, string name, params Type[] args)
-        {
-            if (componentType == null)
-            {
-                throw new ArgumentNullException(nameof(componentType));
-            }
-
-            if (string.IsNullOrEmpty(name))
-            {
-                throw new ArgumentException("message", nameof(name));
-            }
-
-            var methods = GetAllMethods(componentType)
-                //.Where(c => c.IsPublic)
-                .ToList();
-
-            foreach (var item in methods.Where(c => c.Name == name))
-            {
-                var args2 = item.GetParameters();
-                if (args.Length == args2.Length)
-                {
-
-                    for (int i = 0; i < args.Length; i++)
-                    {
-                        if (args[i] != args2[i].ParameterType)
-                        {
-                            continue;
-                        }
-                    }
-
-                    return item;
-
-                }
-            }
-
-            return null;
-
-        }
-
-        public static IEnumerable<MethodInfo> GetAllMethods(this Type componentType)
-        {
-
-            if (componentType == null)
-            {
-                throw new ArgumentNullException(nameof(componentType));
-            }
-
-            var type = componentType;
-
-            while (type != null && type != typeof(object))
-            {
-
-                foreach (var item in type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static))
-                {
-                    yield return item;
-                }
-
-                type = type.BaseType;
-
-            }
-        }
-
-        public static IEnumerable<PropertyInfo> GetAllProperties(this Type componentType)
-        {
-
-            if (componentType == null)
-            {
-                throw new ArgumentNullException(nameof(componentType));
-            }
-
-            var type = componentType;
-
-            while (type != null && type != typeof(object))
-            {
-
-                foreach (var item in type.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static))
-                {
-                    yield return item;
-                }
-
-                type = type.BaseType;
-
-            }
-        }
-
-        #endregion Expressions
-
-        #region private
-
-        private static Dictionary<Type, Func<object, Dictionary<string, object>>> _funcs = new Dictionary<Type, Func<object, Dictionary<string, object>>>();
-
-        #endregion private
+        private readonly static string _sessionId;
 
     }
 
 }
+
+
+
+//System.Text.StringBuilder sb = new System.Text.StringBuilder();
+//var reader = ExceptionObjectSource.Extract(ex);
+//while (reader.Count > 0)
+//{
+//    MyException i = reader.Dequeue();
+//    sb.AppendLine(i.Message + "<BR />");
+//    foreach (MyFrame item in i.stackTrace)
+//        sb.AppendLine(item.ReflectionMethod.Code);
+//}
+//dicParameters.Add(new KeyValuePair<string, object>("code", sb.ToString()));
